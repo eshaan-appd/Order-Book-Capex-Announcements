@@ -1,14 +1,19 @@
 import os
-import requests, pandas as pd, time, re
-from datetime import datetime, date
+import json
+import tempfile
+import re
+import time
+from datetime import date
+
+import requests
+import pandas as pd
+import numpy as np
 import streamlit as st
 from openai import OpenAI
-import json
-import numpy as np
 
-# --------------------
+# =========================================
 # Config
-# --------------------
+# =========================================
 
 HOME = "https://www.bseindia.com/"
 CORP = "https://www.bseindia.com/corporates/ann.html"
@@ -29,18 +34,129 @@ BASE_HEADERS = {
     "Pragma": "no-cache",
 }
 
-# how many rows (per table) you allow OpenAI to enrich
-MAX_OPENAI_ROWS = 30
 OPENAI_MODEL = "gpt-4.1-mini"
+MAX_OPENAI_ROWS = 30  # limit cost
 
-# --------------------
-# Backend (resilient fetcher)
-# --------------------
+# =========================================
+# OpenAI helpers (same stack as file 3)
+# =========================================
+
+def get_openai_client() -> OpenAI:
+    api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+    if not api_key:
+        st.error("Missing OPENAI_API_KEY (env var or Streamlit secrets).")
+        st.stop()
+    return OpenAI(api_key=api_key)
+
+def call_openai_json(client: OpenAI, prompt: str, file_id: str | None = None,
+                     max_tokens: int = 600, temperature: float = 0.2) -> dict | None:
+    """
+    Call Responses API with web_search (and optional PDF file) and
+    return parsed JSON dict (or None on failure).
+    """
+    content = [{"type": "input_text", "text": prompt}]
+    if file_id:
+        content.append({"type": "input_file", "file_id": file_id})
+
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        temperature=temperature,
+        max_output_tokens=max_tokens,
+        tools=[{"type": "web_search"}],
+        input=[{
+            "role": "user",
+            "content": content,
+        }],
+    )
+
+    txt = (getattr(resp, "output_text", None) or "").strip()
+    if not txt:
+        return None
+
+    cleaned = (
+        txt.strip()
+        .replace("```json", "")
+        .replace("```", "")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+    )
+
+    # Try to isolate JSON block
+    if "{" in cleaned and "}" in cleaned:
+        cleaned = cleaned[cleaned.find("{"): cleaned.rfind("}") + 1]
+
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        return None
+
+def upload_pdf_to_openai(client: OpenAI, pdf_bytes: bytes, fname: str = "doc.pdf"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp.flush()
+        f = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
+    return f
+
+# =========================================
+# PDF helpers (adapted from file 3)
+# =========================================
+
+def candidate_pdf_urls(row) -> list[str]:
+    """
+    Build possible PDF URLs from ATTACHMENTNAME + NSURL.
+    """
+    cands = []
+    att = str(row.get("ATTACHMENTNAME") or "").strip()
+    if att:
+        cands += [
+            f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{att}",
+            f"https://www.bseindia.com/xml-data/corpfiling/Attach/{att}",
+            f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{att}",
+        ]
+    ns = str(row.get("NSURL") or "").strip()
+    if ".pdf" in ns.lower():
+        cands.append(
+            ns if ns.lower().startswith("http")
+            else HOME + ns.lstrip("/")
+        )
+    # dedupe
+    seen, out = set(), []
+    for u in cands:
+        if u and u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out
+
+def primary_bse_url(row) -> str:
+    ns = str(row.get("NSURL") or "").strip()
+    if not ns:
+        return ""
+    return ns if ns.lower().startswith("http") else HOME + ns.lstrip("/")
+
+def download_pdf(url: str, timeout: int = 25) -> bytes | None:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "Referer": CORP,
+    })
+    r = s.get(url, timeout=timeout, allow_redirects=True)
+    if r.status_code != 200:
+        return None
+    data = r.content
+    if not data or len(data) < 500:
+        return None
+    return data
+
+# =========================================
+# Backend: BSE fetcher (from file 1)
+# =========================================
 
 def _call_once(s: requests.Session, url: str, params: dict):
     """One guarded call; returns (rows, total, meta)."""
     r = s.get(url, params=params, timeout=30)
-    ct = r.headers.get("content-type","")
+    ct = r.headers.get("content-type", "")
     if "application/json" not in ct:
         return [], None, {"blocked": True, "ct": ct, "status": r.status_code}
     data = r.json()
@@ -91,7 +207,7 @@ def _fetch_single_range(s, d1: str, d2: str, log):
                                     try:
                                         s.get(HOME, timeout=10)
                                         s.get(CORP, timeout=10)
-                                    except:
+                                    except Exception:
                                         pass
                                     rows, total, meta = _call_once(s, ep, params)
                                     if meta.get("blocked"):
@@ -127,7 +243,7 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=N
     try:
         s.get(HOME, timeout=15)
         s.get(CORP, timeout=15)
-    except:
+    except Exception:
         pass
 
     log.append(f"Full fetch: {start_yyyymmdd}..{end_yyyymmdd}")
@@ -170,89 +286,117 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=N
 
     return df
 
-# --------------------
+# =========================================
 # Filters: Orders + Capex
-# --------------------
+# =========================================
 
-ORDER_KEYWORDS = ["order","contract","bagged","supply","purchase order"]
+ORDER_KEYWORDS = ["order", "contract", "bagged", "supply", "purchase order"]
 ORDER_REGEX = re.compile(r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE)
 
+# Focus on commercial production–type capex, as requested
 CAPEX_KEYWORDS = [
-    "capex","capital expenditure","capacity expansion",
-    "new plant","manufacturing facility","brownfield","greenfield",
-    "setting up a plant","increase in capacity","expansion",
-    "commercial production"  # added as requested
+    "commercial production",
+    "commencement of commercial production",
+    "commenced commercial production",
 ]
 CAPEX_REGEX = re.compile("|".join(CAPEX_KEYWORDS), re.IGNORECASE)
 
-def enrich_orders(df):
-    if df.empty: 
+def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
         return df
     mask = df["HEADLINE"].fillna("").str.contains(ORDER_REGEX)
-    out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","NSURL"]].copy()
-    out.columns = ["Company","Announcement","Details","Date","Link"]
+    out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","ATTACHMENTNAME","NSURL"]].copy()
+    out.columns = ["Company","Announcement","Details","Date","Attachment","Link"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
     return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
-def enrich_capex(df):
-    if df.empty: 
+def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
         return df
     combined = (df["HEADLINE"].fillna("") + " " + df["NEWSSUB"].fillna(""))
     mask = combined.str.contains(CAPEX_REGEX, na=False)
-    out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","NSURL"]].copy()
-    out.columns = ["Company","Announcement","Details","Date","Link"]
+    out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","ATTACHMENTNAME","NSURL"]].copy()
+    out.columns = ["Company","Announcement","Details","Date","Attachment","Link"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
     return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
-# --------------------
-# OpenAI helpers
-# --------------------
+# =========================================
+# OpenAI enrichment: Orders
+# =========================================
 
-def get_openai_client():
-    api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-    if not api_key:
-        st.error("Missing OPENAI_API_KEY (env var or Streamlit secrets).")
-        st.stop()
-    return OpenAI(api_key=api_key)
-
-def call_openai(client: OpenAI, prompt: str, max_tokens: int = 400, temperature: float = 0.15) -> str:
-    """Thin wrapper around Responses API returning plain text."""
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        temperature=temperature,
-        max_output_tokens=max_tokens,
-        input=prompt,
-    )
-    # new SDK exposes helper for text
-    return (resp.output_text or "").strip()
-
-def enrich_orders_with_openai(orders_df: pd.DataFrame, client: OpenAI) -> pd.DataFrame:
-    """Add TTM Revenue, Market Cap, Existing & Current Order Book via OpenAI."""
+def enrich_orders_with_openai(orders_df: pd.DataFrame, raw_df: pd.DataFrame, client: OpenAI) -> pd.DataFrame:
+    """
+    For each order announcement (top MAX_OPENAI_ROWS):
+      - Use PDF (if available) to extract Existing Order Book (₹ Cr).
+      - Use web_search to get TTM Revenue, Market Cap, Current Order Book (₹ Cr).
+    """
     if orders_df.empty:
         return orders_df
 
     df = orders_df.copy()
-    cols = [
-        "TTM Revenue (₹ Cr)",
-        "Market Cap (₹ Cr)",
-        "Existing Order Book (₹ Cr)",
-        "Current Order Book (₹ Cr)",
-    ]
-    for c in cols:
-        df[c] = np.nan
+    df["TTM Revenue (₹ Cr)"] = np.nan
+    df["Market Cap (₹ Cr)"] = np.nan
+    df["Existing Order Book (₹ Cr)"] = np.nan
+    df["Current Order Book (₹ Cr)"] = np.nan
+
+    # map back to original rows for ATTACHMENTNAME / NSURL if needed
+    raw_index = raw_df.set_index(["SLONGNAME","HEADLINE","NEWS_DT"])
 
     for idx, row in df.head(MAX_OPENAI_ROWS).iterrows():
         company = str(row["Company"])
-        ann = str(row["Announcement"])
+        ann     = str(row["Announcement"])
         details = str(row.get("Details") or "")
+        date_val = str(row["Date"].date()) if pd.notnull(row["Date"]) else ""
 
+        # locate original row to get attachment name, NSURL
+        try:
+            raw_row = raw_index.loc[(company, ann, row["Date"].strftime("%d %b %Y"))]
+        except Exception:
+            raw_row = None
+
+        # --------- PDF upload for existing order book ---------
+        file_id = None
+        if raw_row is not None:
+            # raw_row might be Series or DataFrame (if duplicates); take first
+            if isinstance(raw_row, pd.DataFrame):
+                raw_row = raw_row.iloc[0]
+            urls = candidate_pdf_urls(raw_row)
+        else:
+            urls = []
+
+        for u in urls:
+            pdf_bytes = download_pdf(u)
+            if pdf_bytes:
+                try:
+                    fobj = upload_pdf_to_openai(client, pdf_bytes, fname="order.pdf")
+                    file_id = fobj.id
+                    break
+                except Exception:
+                    file_id = None
+            time.sleep(0.3)
+
+        # --------- Build prompt ---------
         prompt = f"""
-You are a fundamental equity analyst.
+You are a fundamental equity analyst specialising in Indian listed companies.
 
-Using only your prior financial knowledge plus the announcement text below, do your best to estimate the following for the listed Indian company. 
-If you genuinely cannot estimate a value, set it to null (not a string).
+Your tasks for the company and announcement below are:
 
-Return ONLY valid JSON in this exact structure, no commentary, no markdown:
+1) Use web_search to fetch the latest **TTM revenue (Sales TTM)** and **Market Capitalisation** for the listed company.  
+   - Prefer reliable sources such as Screener.in, stock exchange sites, Moneycontrol, etc.  
+   - Convert both to **INR Crore (₹ Cr)**.  
+   - If you fail to obtain a reliable value even after search, return null.
+
+2) Determine the **Existing Order Book (₹ Cr)** *before* this new order:
+   - Use ONLY the attached PDF filing if available (do NOT use web_search for this field).  
+   - If the filing gives an order book figure, use that.  
+   - If it is not clearly stated in the PDF, return null.
+
+3) Estimate the **Current Order Book (₹ Cr)** *after* including this new order:
+   - Use web_search if needed (e.g., company presentations or recent disclosures).  
+   - Combine the existing order book (from the filing or search) and the value of this newly announced order if you can infer it.  
+   - If you cannot estimate, return null.
+
+Return ONLY valid JSON in this shape (no extra keys, no commentary):
 
 {{
   "ttm_revenue_cr": <number or null>,
@@ -264,28 +408,37 @@ Return ONLY valid JSON in this exact structure, no commentary, no markdown:
 Company: {company}
 Announcement headline: {ann}
 Announcement details: {details}
+Date: {date_val}
 """
 
-        try:
-            txt = call_openai(client, prompt, max_tokens=350)
-            data = json.loads(
-                txt.strip()
-                .replace("```json", "")
-                .replace("```", "")
-            )
-        except Exception:
-            # if anything goes wrong, just leave NaNs and continue
+        data = call_openai_json(client, prompt, file_id=file_id, max_tokens=650, temperature=0.1)
+        if not data:
             continue
 
-        df.at[idx, "TTM Revenue (₹ Cr)"] = data.get("ttm_revenue_cr")
-        df.at[idx, "Market Cap (₹ Cr)"] = data.get("market_cap_cr")
-        df.at[idx, "Existing Order Book (₹ Cr)"] = data.get("existing_order_book_cr")
-        df.at[idx, "Current Order Book (₹ Cr)"] = data.get("current_order_book_cr")
+        def _as_float(x):
+            if x is None:
+                return np.nan
+            try:
+                return float(str(x).replace(",", ""))
+            except Exception:
+                return np.nan
+
+        df.at[idx, "TTM Revenue (₹ Cr)"]         = _as_float(data.get("ttm_revenue_cr"))
+        df.at[idx, "Market Cap (₹ Cr)"]          = _as_float(data.get("market_cap_cr"))
+        df.at[idx, "Existing Order Book (₹ Cr)"] = _as_float(data.get("existing_order_book_cr"))
+        df.at[idx, "Current Order Book (₹ Cr)"]  = _as_float(data.get("current_order_book_cr"))
 
     return df
 
+# =========================================
+# OpenAI enrichment: Capex Impact
+# =========================================
+
 def enrich_capex_with_openai(capex_df: pd.DataFrame, client: OpenAI) -> pd.DataFrame:
-    """Add an 'Impact' column, focusing on commercial production–type capex."""
+    """
+    Add an 'Impact' paragraph for capex announcements, especially those
+    with 'commercial production' language.
+    """
     if capex_df.empty:
         return capex_df
 
@@ -294,49 +447,72 @@ def enrich_capex_with_openai(capex_df: pd.DataFrame, client: OpenAI) -> pd.DataF
 
     for idx, row in df.head(MAX_OPENAI_ROWS).iterrows():
         company = str(row["Company"])
-        ann = str(row["Announcement"])
+        ann     = str(row["Announcement"])
         details = str(row.get("Details") or "")
 
         text_for_filter = (ann + " " + details).lower()
         if "commercial production" not in text_for_filter:
-            # you said: filter capex announcements using keywords like commercial production
+            # we still keep row, but skip Impact to stay aligned with your requirement
             continue
 
         prompt = f"""
-You are a sell-side equity research analyst writing a short impact commentary for a capex / plant-commissioning announcement.
+You are a sell-side equity research analyst.
 
-Write a crisp impact paragraph (3–5 sentences, max ~130 words) explaining:
-- what has commenced (e.g., commercial production of which product / capacity),
-- how this shifts the company's margin / growth trajectory versus the core business,
-- approximate revenue/EBITDA potential range if it is clear from the text (in INR crores, not percentages),
-- key execution / market risks that an investor should monitor.
+Write a concise, investor-focused **Impact** paragraph (3–6 sentences, max ~140 words)
+for the following capex / plant-commissioning announcement.
 
-Tone: analytical, neutral-positive, no hype, no bullet points, no headings, just a single paragraph of plain text.
+Be specific on:
+- what has commenced (product, capacity, plant location),
+- how it shifts the company's growth and margin trajectory vs existing business,
+- rough revenue and EBITDA potential range in INR crore (if it can be inferred),
+- major execution / market risks that investors should track during ramp-up.
+
+Tone: neutral-analytical (no hype, no jargon). Output plain text, no bullets, no heading.
 
 Company: {company}
-Announcement: {ann}
+Headline: {ann}
 Details: {details}
 """
 
-        try:
-            impact = call_openai(client, prompt, max_tokens=220, temperature=0.25)
-        except Exception:
-            impact = ""
+        data = call_openai_json(client, prompt, file_id=None, max_tokens=280, temperature=0.25)
+        # For Impact we just want raw text; call_openai_json expects JSON so use a simpler call instead:
+        if data is None:
+            # Fallback: plain text call without JSON schema
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                temperature=0.25,
+                max_output_tokens=280,
+                input=prompt,
+            )
+            impact = (getattr(resp, "output_text", None) or "").strip()
+        else:
+            # If the model still returned JSON, try to map a key; otherwise fallback below.
+            impact = data.get("impact") if isinstance(data, dict) else ""
+
+        if not impact:
+            # As extra safety, do a simple non-JSON call
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                temperature=0.25,
+                max_output_tokens=280,
+                input=prompt,
+            )
+            impact = (getattr(resp, "output_text", None) or "").strip()
 
         df.at[idx, "Impact"] = impact
 
     return df
 
-# --------------------
+# =========================================
 # Streamlit UI
-# --------------------
+# =========================================
 
-st.set_page_config(page_title="BSE Order & Capex Announcements (OpenAI-enriched)", layout="wide")
-st.title("📣 BSE Order & Capex Announcements Finder (with OpenAI Enrichment)")
+st.set_page_config(page_title="BSE Order & Capex (OpenAI-enriched)", layout="wide")
+st.title("📣 BSE Order & Capex Announcements — OpenAI + Web Search")
 
 col1, col2 = st.columns(2)
 with col1:
-    start_date = st.date_input("Start Date", value=date(2025,1,1))
+    start_date = st.date_input("Start Date", value=date(2025, 1, 1))
 with col2:
     end_date = st.date_input("End Date", value=date.today())
 
@@ -349,51 +525,54 @@ if run:
 
     ds = start_date.strftime("%Y%m%d")
     de = end_date.strftime("%Y%m%d")
-    logs = []
+    logs: list[str] = []
 
     with st.spinner("Fetching BSE announcements..."):
-        df = fetch_bse_announcements_strict(ds, de, log=logs)
+        df_raw = fetch_bse_announcements_strict(ds, de, log=logs)
 
-    orders_df = enrich_orders(df)
-    capex_df = enrich_capex(df)
+    orders_df = enrich_orders(df_raw)
+    capex_df  = enrich_capex(df_raw)
 
-    st.subheader("High-level counts")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total Announcements", len(df))
+    c1.metric("Total Announcements", len(df_raw))
     c2.metric("Order Announcements", len(orders_df))
-    c3.metric("Capex Announcements (incl. commercial production)", len(capex_df))
+    c3.metric("Capex Announcements (commercial production–filtered)", len(capex_df))
 
-    if df.empty:
-        st.warning("No announcements found for this range.")
+    if df_raw.empty:
+        st.warning("No announcements found for this date range.")
         st.stop()
 
-    # OpenAI client (only if we actually have rows to enrich)
-    client = None
-    if not orders_df.empty or not capex_df.empty:
-        client = get_openai_client()
+    client = get_openai_client()
 
-    if client is not None and not orders_df.empty:
-        with st.spinner(f"Enriching top {min(MAX_OPENAI_ROWS, len(orders_df))} order announcements with OpenAI..."):
-            orders_df = enrich_orders_with_openai(orders_df, client)
+    if not orders_df.empty:
+        with st.spinner(f"Enriching top {min(MAX_OPENAI_ROWS, len(orders_df))} order announcements via internet + PDF..."):
+            orders_df = enrich_orders_with_openai(orders_df, df_raw, client)
 
-    if client is not None and not capex_df.empty:
-        with st.spinner(f"Generating 'Impact' for top {min(MAX_OPENAI_ROWS, len(capex_df))} capex announcements (commercial production focused)..."):
+    if not capex_df.empty:
+        with st.spinner(f"Generating 'Impact' commentary for capex announcements (commercial production)..."):
             capex_df = enrich_capex_with_openai(capex_df, client)
 
-    tab_orders, tab_capex, tab_all, tab_logs = st.tabs(["📦 Orders (Enriched)", "🏭 Capex (Impact)", "📄 All Raw", "🧪 Fetch Logs"])
+    tab_orders, tab_capex, tab_all, tab_logs = st.tabs(
+        ["📦 Orders (Enriched)", "🏭 Capex (Impact)", "📄 All Raw", "🧪 Fetch Logs"]
+    )
 
     with tab_orders:
-        st.caption("Includes OpenAI-estimated TTM Revenue, Market Cap and Order Book metrics (where available).")
+        st.caption(
+            "TTM Revenue, Market Cap, and Current Order Book are fetched via OpenAI web_search. "
+            "Existing Order Book is extracted from the filing PDF where available."
+        )
         st.dataframe(orders_df, use_container_width=True)
 
     with tab_capex:
-        st.caption("Filtered using capex keywords including 'commercial production'. Impact column is generated via OpenAI for top rows.")
+        st.caption(
+            "Capex announcements filtered on 'commercial production' keywords. "
+            "Impact column is generated by OpenAI."
+        )
         st.dataframe(capex_df, use_container_width=True)
 
     with tab_all:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df_raw, use_container_width=True)
 
     with tab_logs:
-        st.write("Fetcher debug log:")
         for line in logs:
             st.text(line)
