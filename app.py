@@ -1,30 +1,69 @@
-import os
-import json
-import tempfile
-import re
-import time
-from datetime import date
+import os, io, re, time, tempfile
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests import exceptions as req_exc
 import pandas as pd
 import numpy as np
-import streamlit as st
 from openai import OpenAI
+import os, streamlit as st
+# ---- OpenAI (Responses API) ----
 
-# =========================================
-# Config
-# =========================================
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+if not api_key:
+    st.error("Missing OPENAI_API_KEY (set env var or add to Streamlit secrets).")
+    st.stop()
+
+client = OpenAI(api_key=api_key)
+
+with st.expander("🔍 OpenAI connection diagnostics", expanded=False):
+    # 1) Is the key visible?
+    key_src = "st.secrets" if "OPENAI_API_KEY" in st.secrets else "env"
+    mask = lambda s: (s[:7] + "..." + s[-4:]) if s and len(s) > 12 else "unset"
+    st.write("Key source:", key_src)
+    st.write("Key (masked):", mask(api_key))
+
+    # 2) Simple status ping
+    try:
+        _ = client.models.list()
+        st.success("OpenAI client initialised successfully.")
+    except Exception as e:
+        st.error(f"OpenAI client initialisation failed: {e}")
+
+# Custom model used for reasoning via Responses API
+OPENAI_MODEL = "gpt-4.1-mini"
+
+#======================
+# Basic settings
+#======================
 
 HOME = "https://www.bseindia.com/"
 CORP = "https://www.bseindia.com/corporates/ann.html"
 
-# Two BSE endpoints with slightly different parameter contracts.
+# --- Order-related keyword logic for filtering ---
+ORDER_KEYWORDS = ["order", "contract", "bagged", "supply", "purchase order"]
+ORDER_REGEX = re.compile(r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE)
+
+# --- Capex / expansion keywords (to seed the search) ---
+CAPEX_KEYWORDS = [
+    "commercial production",
+    "commencement of commercial production",
+    "commenced commercial production",
+    "capex", "capital expenditure", "capacity expansion",
+    "new plant", "manufacturing facility", "brownfield", "greenfield",
+    "setting up a plant", "increase in capacity", "expansion"
+]
+CAPEX_REGEX = re.compile("|".join(map(re.escape, CAPEX_KEYWORDS)), re.IGNORECASE)
+
+MAX_CAPEX_ROWS_OPENAI = 200
+
+# BSE endpoints (older + newer)
 ENDPOINTS = [
     "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w",
     "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w",
 ]
 
-# Common headers to avoid being blocked as a bot.
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json, text/plain, */*",
@@ -36,364 +75,153 @@ BASE_HEADERS = {
     "Pragma": "no-cache",
 }
 
-OPENAI_MODEL = "gpt-4.1-mini"
-MAX_OPENAI_ROWS = 200  # cap mainly used for capex; orders enrich ALL rows now
+#======================
+# Small helpers
+#======================
 
-# =========================================
-# OpenAI helpers
-# =========================================
-
-def get_openai_client() -> OpenAI:
-    """
-    Initialise the OpenAI client, reading the API key from
-    Streamlit secrets or environment variable.
-    """
-    api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-    if not api_key:
-        st.error("Missing OPENAI_API_KEY (env var or Streamlit secrets).")
-        st.stop()
-    return OpenAI(api_key=api_key)
-
-def call_openai_json(
-    client: OpenAI,
-    prompt: str,
-    file_id: str | None = None,
-    max_tokens: int = 600,
-    temperature: float = 0.2,
-) -> dict | None:
-    """
-    Call the Responses API with:
-      - web_search tool enabled
-      - optional PDF file attached (file_id)
-    Expect a JSON string back and return it as a Python dict.
-
-    If parsing fails, return None and let the caller fall back / skip.
-    """
-    # Build multi-part content: text + optional file.
-    content = [{"type": "input_text", "text": prompt}]
-    if file_id:
-        content.append({"type": "input_file", "file_id": file_id})
-
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        temperature=temperature,
-        max_output_tokens=max_tokens,
-        tools=[{"type": "web_search"}],
-        input=[{"role": "user", "content": content}],
-    )
-
-    txt = (getattr(resp, "output_text", None) or "").strip()
-    if not txt:
-        return None
-
-    # Clean wrappers / smart quotes that sometimes appear in model output.
-    cleaned = (
-        txt.strip()
-        .replace("```json", "")
-        .replace("```", "")
-        .replace("“", '"')
-        .replace("”", '"')
-        .replace("’", "'")
-    )
-
-    # Try to isolate the JSON object region explicitly.
-    if "{" in cleaned and "}" in cleaned:
-        cleaned = cleaned[cleaned.find("{") : cleaned.rfind("}") + 1]
-
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        return None
-
-def upload_pdf_to_openai(client: OpenAI, pdf_bytes: bytes, fname: str = "doc.pdf"):
-    """
-    Persist a PDF to OpenAI so it can be referenced in the Responses call.
-    """
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes)
-        tmp.flush()
-        f = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
-    return f
-
-# =========================================
-# PDF helpers
-# =========================================
-
-def candidate_pdf_urls(row) -> list[str]:
-    """
-    Build a list of possible PDF URLs from ATTACHMENTNAME + NSURL for a row.
-    We try multiple base paths because BSE moves attachments between folders.
-    """
-    cands = []
-    att = str(row.get("ATTACHMENTNAME") or "").strip()
-    if att:
-        cands += [
-            f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{att}",
-            f"https://www.bseindia.com/xml-data/corpfiling/Attach/{att}",
-            f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{att}",
-        ]
-    ns = str(row.get("NSURL") or "").strip()
-    if ".pdf" in ns.lower():
-        cands.append(ns if ns.lower().startswith("http") else HOME + ns.lstrip("/"))
-
-    # De-duplicate while preserving order.
-    seen, out = set(), []
-    for u in cands:
-        if u and u not in seen:
-            out.append(u)
-            seen.add(u)
-    return out
-
-def primary_bse_url(row) -> str:
-    """
-    Compose a full BSE URL from the NSURL field.
-    """
-    ns = str(row.get("NSURL") or "").strip()
-    if not ns:
+def _norm(x):
+    if x is None:
         return ""
-    return ns if ns.lower().startswith("http") else HOME + ns.lstrip("/")
+    return str(x).strip()
 
-def download_pdf(url: str, timeout: int = 25) -> bytes | None:
+def _first_col(df: pd.DataFrame, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+#======================
+# BSE fetch (Company Update / M&A etc.)
+#======================
+
+def fetch_bse_announcements_strict(start_yyyymmdd: str,
+                                   end_yyyymmdd: str,
+                                   verbose: bool = True,
+                                   request_timeout: int = 25) -> pd.DataFrame:
+    """Fetches raw announcements, then filters:
+    Category='Company Update' AND subcategory contains any:
+    Acquisition | Amalgamation / Merger | Scheme of Arrangement | Joint Venture
     """
-    Download PDF bytes from a URL. Return None if we fail or content is too small.
-    """
+    assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
+    assert start_yyyymmdd <= end_yyyymmdd
+    base_page = "https://www.bseindia.com/corporates/ann.html"
+    url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+
     s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/pdf,application/octet-stream,*/*",
-            "Referer": CORP,
-        }
-    )
-    r = s.get(url, timeout=timeout, allow_redirects=True)
-    if r.status_code != 200:
-        return None
-    data = r.content
-    if not data or len(data) < 500:  # tiny PDFs are usually error pages
-        return None
-    return data
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": base_page,
+        "X-Requested-With": "XMLHttpRequest",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
 
-# =========================================
-# Backend: BSE fetcher
-# =========================================
-
-def _call_once(s: requests.Session, url: str, params: dict):
-    """
-    Single low-level call to the BSE API.
-    Returns (rows, total, meta) where meta captures 'blocked' state.
-    """
-    r = s.get(url, params=params, timeout=30)
-    ct = r.headers.get("content-type", "")
-    if "application/json" not in ct:
-        # If we see HTML (block page / error), mark this attempt as blocked.
-        return [], None, {"blocked": True, "ct": ct, "status": r.status_code}
-    data = r.json()
-    rows = data.get("Table") or []
-    total = None
     try:
-        total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
-    except Exception:
-        pass
-    return rows, total, {}
-
-def _fetch_single_range(s: requests.Session, d1: str, d2: str, log):
-    """
-    Fetch a single date range (usually one day) using multiple parameter
-    permutations to deal with BSE's inconsistent API behaviour.
-    """
-    search_opts = ["", "P"]
-    seg_opts = ["C", "E"]
-    subcat_opts = ["", "-1"]
-    pageno_keys = ["pageno", "Pageno"]
-    scrip_keys = ["strScrip", "strscrip"]
-
-    for ep in ENDPOINTS:
-        for strType in seg_opts:
-            for strSearch in search_opts:
-                for subcategory in subcat_opts:
-                    for pageno_key in pageno_keys:
-                        for scrip_key in scrip_keys:
-
-                            params = {
-                                pageno_key: 1,
-                                "strCat": "-1",
-                                "strPrevDate": d1,
-                                "strToDate": d2,
-                                scrip_key: "",
-                                "strSearch": strSearch,
-                                "strType": strType,
-                                "subcategory": subcategory,
-                            }
-
-                            log.append(
-                                f"Trying {ep} | {pageno_key} | {scrip_key} | Type={strType} | {d1}..{d2}"
-                            )
-
-                            rows_acc = []
-                            page = 1
-
-                            while True:
-                                rows, total, meta = _call_once(s, ep, params)
-
-                                # If we got HTML / block page, warm up and retry once.
-                                if meta.get("blocked"):
-                                    log.append("Blocked: retry warmup")
-                                    try:
-                                        s.get(HOME, timeout=10)
-                                        s.get(CORP, timeout=10)
-                                    except Exception:
-                                        pass
-                                    rows, total, meta = _call_once(s, ep, params)
-                                    if meta.get("blocked"):
-                                        break
-
-                                if page == 1 and total == 0 and not rows:
-                                    break  # no results for this configuration
-
-                                if not rows:
-                                    break  # exhausted pages
-
-                                rows_acc.extend(rows)
-                                params[pageno_key] += 1
-                                page += 1
-
-                                if total and len(rows_acc) >= total:
-                                    break
-
-                            if rows_acc:
-                                return rows_acc
-
-    return []
-
-def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=None):
-    """
-    Fetch announcements between start_yyyymmdd and end_yyyymmdd (inclusive).
-
-    The BSE API behaves best when strPrevDate == strToDate, so we:
-      1. Loop day-by-day over the range.
-      2. Call _fetch_single_range for each day.
-      3. Concatenate & de-duplicate the results.
-    """
-    if log is None:
-        log = []
-
-    # Single session + warmup to reduce TLS overhead.
-    s = requests.Session()
-    s.headers.update(BASE_HEADERS)
-    try:
-        s.get(HOME, timeout=15)
-        s.get(CORP, timeout=15)
+        s.get(base_page, timeout=15)
     except Exception:
         pass
 
-    start_dt = pd.to_datetime(start_yyyymmdd, format="%Y%m%d")
-    end_dt = pd.to_datetime(end_yyyymmdd, format="%Y%m%d")
-
-    if end_dt < start_dt:
-        # Defensive: inverted range -> empty DF.
-        return pd.DataFrame(
-            columns=[
-                "SCRIP_CD",
-                "SLONGNAME",
-                "HEADLINE",
-                "NEWSSUB",
-                "NEWS_DT",
-                "ATTACHMENTNAME",
-                "NSURL",
-            ]
-        )
-
-    all_rows: list[dict] = []
-
-    cur = start_dt
-    while cur <= end_dt:
-        d_str = cur.strftime("%Y%m%d")
-        log.append(f"Day chunk fetch: {d_str}..{d_str}")
-        rows = _fetch_single_range(s, d_str, d_str, log)
-        if rows:
-            all_rows.extend(rows)
-        cur += pd.Timedelta(days=1)
-
-    if not all_rows:
-        return pd.DataFrame(
-            columns=[
-                "SCRIP_CD",
-                "SLONGNAME",
-                "HEADLINE",
-                "NEWSSUB",
-                "NEWS_DT",
-                "ATTACHMENTNAME",
-                "NSURL",
-            ]
-        )
-
-    # Build DataFrame with dynamic extra columns if present.
-    base_cols = [
-        "SCRIP_CD",
-        "SLONGNAME",
-        "HEADLINE",
-        "NEWSSUB",
-        "NEWS_DT",
-        "ATTACHMENTNAME",
-        "NSURL",
-        "NEWSID",
+    variants = [
+        {"subcategory": "-1", "strSearch": "P"},
+        {"subcategory": "-1", "strSearch": ""},
+        {"subcategory": "",   "strSearch": "P"},
+        {"subcategory": "",   "strSearch": ""},
     ]
 
-    seen = set(base_cols)
-    extra_cols = []
-    for r in all_rows:
-        for k in r.keys():
-            if k not in seen:
-                extra_cols.append(k)
-                seen.add(k)
+    all_rows = []
+    for v in variants:
+        params = {
+            "pageno": 1, "strCat": "-1", "subcategory": v["subcategory"],
+            "strPrevDate": start_yyyymmdd, "strToDate": end_yyyymmdd,
+            "strSearch": v["strSearch"], "strscrip": "", "strType": "C",
+        }
+        rows, total, page = [], None, 1
+        while True:
+            try:
+                r = s.get(url, params=params, timeout=request_timeout)
+            except req_exc.ReadTimeout as e:
+                if verbose:
+                    st.warning(f"[variant {v}] ReadTimeout on page {page}: {e}")
+                rows = []
+                break
+            except req_exc.RequestException as e:
+                if verbose:
+                    st.warning(f"[variant {v}] Request error on page {page}: {e}")
+                rows = []
+                break
 
-    df = pd.DataFrame(all_rows, columns=base_cols + extra_cols)
+            ct = r.headers.get("content-type","")
+            if "application/json" not in ct:
+                if verbose:
+                    st.warning(f"[variant {v}] non-JSON on page {page} (ct={ct}).")
+                break
 
-    # De-duplicate using reasonably stable keys.
-    keys = ["NSURL", "NEWSID", "ATTACHMENTNAME", "HEADLINE"]
-    keys = [k for k in keys if k in df.columns]
-    if keys:
-        df = df.drop_duplicates(subset=keys)
+            data = r.json()
+            table = data.get("Table") or []
+            rows.extend(table)
 
-    # Sort by NEWS_DT descending (most recent first).
-    if "NEWS_DT" in df.columns:
-        df["_NEWS_DT_PARSED"] = pd.to_datetime(
-            df["NEWS_DT"], errors="coerce", dayfirst=True
+            if total is None:
+                try:
+                    total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
+                except Exception:
+                    total = None
+
+            if not table:
+                break
+
+            params["pageno"] += 1
+            page += 1
+            time.sleep(0.25)
+
+            if total and len(rows) >= total:
+                break
+
+        if rows:
+            all_rows = rows; break
+
+    if not all_rows: return pd.DataFrame()
+
+    all_keys = set()
+    for r in all_rows: all_keys.update(r.keys())
+    df = pd.DataFrame(all_rows, columns=list(all_keys))
+
+    # Filter to Company Update
+    def filter_announcements(df_in: pd.DataFrame, category_filter="Company Update") -> pd.DataFrame:
+        if df_in.empty: return df_in.copy()
+        cat_col = _first_col(df_in, ["CATEGORYNAME", "CATEGORY", "NEWS_CAT", "NEWSCATEGORY", "NEWS_CATEGORY"])
+        if not cat_col: return df_in.copy()
+        df2 = df_in.copy()
+        df2["_cat_norm"] = df2[cat_col].map(lambda x: _norm(x).lower())
+        return df2.loc[df2["_cat_norm"] == _norm(category_filter).lower()].drop(columns=["_cat_norm"])
+
+    df_filtered = filter_announcements(df, category_filter="Company Update")
+    if df_filtered.empty:
+        return df_filtered
+
+    # Filter to those subcategories
+    df_filtered = df_filtered.loc[
+        df_filtered
+        .filter(["NEWSSUB", "SUBCATEGORY", "SUBCATEGORYNAME", "NEWS_SUBCATEGORY", "NEWS_SUB"], axis=1)
+        .astype(str)
+        .apply(
+            lambda col: col.str.contains(
+                r"(Acquisition|Amalgamation\s*/\s*Merger|Scheme of Arrangement|Joint Venture)",
+                case=False,
+                na=False,
+            )
         )
-        df = (
-            df.sort_values("_NEWS_DT_PARSED", ascending=False)
-            .drop(columns=["_NEWS_DT_PARSED"])
-            .reset_index(drop=True)
-        )
+        .any(axis=1)
+    ]
 
-    return df
+    return df_filtered
 
-# =========================================
-# Filters: Orders + Capex
-# =========================================
-
-# Keywords that mark an announcement as "order / contract".
-ORDER_KEYWORDS = ["order", "contract", "bagged", "supply", "purchase order"]
-ORDER_REGEX = re.compile(
-    r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE
-)
-
-# Capex / capacity / plant / expansion keywords (broader set).
-CAPEX_KEYWORDS = [
-    "commercial production",
-    "commencement of commercial production",
-    "commenced commercial production",
-    "capex", "capital expenditure", "capacity expansion",
-    "new plant", "manufacturing facility", "brownfield", "greenfield",
-    "setting up a plant", "increase in capacity", "expansion"
-]
-CAPEX_REGEX = re.compile("|".join(map(re.escape, CAPEX_KEYWORDS)), re.IGNORECASE)
+#======================
+# Announcement filters (Orders / Capex)
+#======================
 
 def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Slice the raw announcements down to order-related items
-    and rename columns into a clean front-end schema.
-    """
     if df.empty:
         return df
     mask = df["HEADLINE"].fillna("").str.contains(ORDER_REGEX)
@@ -405,14 +233,7 @@ def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
     return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
-def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filter to announcements whose HEADLINE or NEWSSUB contain
-    capex/expansion-related keywords, then map into a clean schema.
-
-    The actual confirmation + impact for capex is done in
-    enrich_capex_with_openai by reading the filing content.
-    """
+def enrich_capex_headline(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     combined = df["HEADLINE"].fillna("") + " " + df["NEWSSUB"].fillna("")
@@ -425,50 +246,125 @@ def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
     return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
-# =========================================
-# OpenAI enrichment: Orders
-# =========================================
+#======================
+# PDF handling
+#======================
 
-def enrich_orders_with_openai(
-    orders_df: pd.DataFrame, raw_df: pd.DataFrame, client: OpenAI
-) -> pd.DataFrame:
-    """
-    Enrich order announcements with:
-      - Latest Revenue (₹ Cr)         [internet via web_search]
-      - Market Cap (₹ Cr)             [internet via web_search]
-      - Order Amount (₹ Cr)           [PDF filing + text ONLY]
-      - Current Order Book (₹ Cr)     [internet + filings/text]
-      - Order Book / Sales (x)        [derived metric = OB / Revenue]
-      - Execution Timeline            [PDF first → else forecast]
+def _candidate_pdf_urls(row: dict) -> list[str]:
+    cands = []
+    att = str(row.get("ATTACHMENTNAME") or "").strip()
+    if att:
+        cands += [
+            f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{att}",
+            f"https://www.bseindia.com/xml-data/corpfiling/Attach/{att}",
+            f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{att}",
+        ]
+    ns = str(row.get("NSURL") or "").strip()
+    if ".pdf" in ns.lower():
+        cands.append(ns if ns.lower().startswith("http") else HOME + ns.lstrip("/"))
 
-    NOTE: This now enriches **all rows** in orders_df (no head() truncation).
-    """
+    seen, out = set(), []
+    for u in cands:
+        if u and u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out
 
+def _download_pdf(url: str, timeout=25) -> bytes:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "Referer": CORP,
+    })
+    r = s.get(url, timeout=timeout, allow_redirects=True, stream=True)
+    if r.status_code != 200:
+        return b""
+    data = r.content
+    if not data or len(data) < 500:
+        return b""
+    return data
+
+def _upload_pdf_to_openai(pdf_bytes: bytes, fname: str = "doc.pdf"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp.flush()
+        f = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
+    return f
+
+#======================
+# OpenAI helpers: JSON call
+#======================
+
+def _call_openai_json(prompt: str,
+                      file_id: str | None = None,
+                      max_tokens: int = 600,
+                      temperature: float = 0.2) -> dict | None:
+    content = [{"type": "input_text", "text": prompt}]
+    if file_id:
+        content.append({"type": "input_file", "file_id": file_id})
+
+    try:
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            tools=[{"type": "web_search"}],
+            input=[{"role": "user", "content": content}],
+        )
+    except Exception as e:
+        st.warning(f"OpenAI JSON call failed: {e}")
+        return None
+
+    txt = (getattr(resp, "output_text", None) or "").strip()
+    if not txt:
+        return None
+
+    cleaned = (
+        txt.strip()
+        .replace("```json", "")
+        .replace("```", "")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+    )
+
+    if "{" in cleaned and "}" in cleaned:
+        cleaned = cleaned[cleaned.find("{") : cleaned.rfind("}") + 1]
+
+    try:
+        return json.loads(cleaned)
+    except Exception as e:
+        st.warning(f"JSON parse error: {e}")
+        return None
+
+#======================
+# Enrich Orders (TTM, MCap, Order Amount, OB, Execution Timeline)
+#======================
+
+import json
+
+def enrich_orders_with_openai(orders_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
     if orders_df.empty:
         return orders_df
 
     df = orders_df.copy()
 
-    # ---------- initialise enrichment columns ----------
     df["TTM / Latest Revenue (₹ Cr)"] = np.nan
     df["Market Cap (₹ Cr)"] = np.nan
     df["Order Amount (₹ Cr)"] = np.nan
     df["Current Order Book (₹ Cr)"] = np.nan
     df["Order Book / Sales (x)"] = np.nan
-    df["Execution Timeline"] = ""   # may come from PDF OR forecast
+    df["Execution Timeline"] = ""
 
-    # Join back to raw BSE row for attachment lookup
     raw_key = raw_df.set_index(["SLONGNAME", "HEADLINE"])
 
-    # >>> ENRICH ALL ROWS (no .head(MAX_OPENAI_ROWS)) <<<
     for idx, row in df.iterrows():
-
         company = str(row["Company"])
         ann     = str(row["Announcement"])
         details = str(row.get("Details") or "")
         date_val = str(row["Date"].date()) if pd.notnull(row["Date"]) else ""
 
-        # ---------- Locate PDF ----------
         try:
             raw_row = raw_key.loc[(company, ann)]
             if isinstance(raw_row, pd.DataFrame):
@@ -477,20 +373,19 @@ def enrich_orders_with_openai(
             raw_row = None
 
         file_id = None
-        urls = candidate_pdf_urls(raw_row) if raw_row is not None else []
+        urls = _candidate_pdf_urls(raw_row) if raw_row is not None else []
 
         for u in urls:
-            pdf_bytes = download_pdf(u)
+            pdf_bytes = _download_pdf(u)
             if pdf_bytes:
                 try:
-                    fobj = upload_pdf_to_openai(client, pdf_bytes, fname="order.pdf")
+                    fobj = _upload_pdf_to_openai(pdf_bytes, fname="order.pdf")
                     file_id = fobj.id
                     break
                 except Exception:
                     pass
             time.sleep(0.2)
 
-        # ---------- PROMPT ----------
         prompt = f"""
 You are a fundamental equity analyst specialising in Indian listed companies.
 
@@ -538,11 +433,10 @@ Details: {details}
 Date: {date_val}
 """
 
-        data = call_openai_json(client, prompt, file_id=file_id, max_tokens=750, temperature=0.1)
+        data = _call_openai_json(prompt, file_id=file_id, max_tokens=750, temperature=0.1)
         if not data:
             continue
 
-        # ---------- helpers ----------
         def _f(x):
             if x is None:
                 return np.nan
@@ -551,7 +445,6 @@ Date: {date_val}
             except Exception:
                 return np.nan
 
-        # ---------- assign ----------
         revenue = _f(data.get("ttm_revenue_cr"))
         mcap    = _f(data.get("market_cap_cr"))
         order   = _f(data.get("order_amount_cr"))
@@ -562,68 +455,51 @@ Date: {date_val}
         df.at[idx, "Order Amount (₹ Cr)"] = order
         df.at[idx, "Current Order Book (₹ Cr)"] = ob_cur
 
-        # ---------- derived ----------
         if pd.notna(revenue) and revenue > 0 and pd.notna(ob_cur):
             df.at[idx, "Order Book / Sales (x)"] = ob_cur / revenue
 
-        # ---------- execution timeline ----------
         timeline = data.get("execution_timeline")
         if timeline:
             df.at[idx, "Execution Timeline"] = str(timeline).strip()
 
     return df
 
-# =========================================
-# OpenAI enrichment: Capex Impact (PDF keyword search)
-# =========================================
+#======================
+# Enrich Capex (Impact paragraph)
+#======================
 
-def enrich_capex_with_openai(capex_df: pd.DataFrame, client: OpenAI) -> pd.DataFrame:
-    """
-    Add an 'Impact' paragraph for capex / expansion announcements.
-
-    For each candidate:
-      - Upload the filing PDF (if available).
-      - Ask OpenAI to SEARCH INSIDE the filing for the CAPEX_KEYWORDS list:
-        ["commercial production", "capex", "capacity expansion", "new plant",
-         "manufacturing facility", "brownfield", "greenfield", etc.]
-      - Use those matches + context to write an impact paragraph.
-
-    This still limits to MAX_OPENAI_ROWS rows per run for cost control.
-    """
+def enrich_capex_with_openai(capex_df: pd.DataFrame) -> pd.DataFrame:
     if capex_df.empty:
         return capex_df
 
     df = capex_df.copy()
     df["Impact"] = ""
 
-    for idx, row in df.head(MAX_OPENAI_ROWS).iterrows():
+    for idx, row in df.head(MAX_CAPEX_ROWS_OPENAI).iterrows():
         company = str(row["Company"])
         ann = str(row["Announcement"])
         details = str(row.get("Details") or "")
 
-        # ---------- Locate PDF, using Attachment + Link from capex_df ----------
         pseudo_raw = {
             "ATTACHMENTNAME": row.get("Attachment"),
             "NSURL": row.get("Link"),
         }
-        urls = candidate_pdf_urls(pseudo_raw)
+        urls = _candidate_pdf_urls(pseudo_raw)
 
         file_id = None
         for u in urls:
-            pdf_bytes = download_pdf(u)
+            pdf_bytes = _download_pdf(u)
             if pdf_bytes:
                 try:
-                    fobj = upload_pdf_to_openai(client, pdf_bytes, fname="capex.pdf")
+                    fobj = _upload_pdf_to_openai(pdf_bytes, fname="capex.pdf")
                     file_id = fobj.id
                     break
                 except Exception:
                     pass
             time.sleep(0.2)
 
-        # Build the keyword list string for the prompt.
         keyword_list_str = ", ".join(CAPEX_KEYWORDS)
 
-        # ---------- PROMPT: explicitly instruct model to search keywords in filing ----------
         prompt = f"""
 You are a sell-side equity research analyst.
 
@@ -665,59 +541,55 @@ Headline: {ann}
 Details: {details}
 """
 
-        # For Impact we want text; attach PDF if available.
         content = [{"type": "input_text", "text": prompt}]
         if file_id:
             content.append({"type": "input_file", "file_id": file_id})
 
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            temperature=0.25,
-            max_output_tokens=280,
-            input=[{"role": "user", "content": content}],
-        )
-        impact = (getattr(resp, "output_text", None) or "").strip()
+        try:
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                temperature=0.25,
+                max_output_tokens=280,
+                input=[{"role": "user", "content": content}],
+            )
+            impact = (getattr(resp, "output_text", None) or "").strip()
+        except Exception as e:
+            impact = f"(OpenAI error while generating impact: {e})"
+
         df.at[idx, "Impact"] = impact
 
     return df
 
-# =========================================
+#======================
 # Streamlit UI
-# =========================================
+#======================
 
 st.set_page_config(
     page_title="BSE Order & Capex (OpenAI-enriched)", layout="wide"
 )
 st.title("📣 BSE Order & Capex Announcements — OpenAI + Web Search")
 
-# Date range inputs.
 col1, col2 = st.columns(2)
 with col1:
-    start_date = st.date_input("Start Date", value=date(2025, 1, 1))
+    start_date = st.date_input("Start Date", value=datetime(2025, 1, 1).date())
 with col2:
-    end_date = st.date_input("End Date", value=date.today())
+    end_date = st.date_input("End Date", value=datetime.today().date())
 
 run = st.button("🔎 Fetch & Enrich", use_container_width=True)
 
 if run:
-    # Basic sanity check.
     if start_date > end_date:
         st.error("Start Date cannot be after End Date.")
         st.stop()
 
     ds = start_date.strftime("%Y%m%d")
     de = end_date.strftime("%Y%m%d")
-    logs: list[str] = []
 
-    # ---------------------------
-    # 1) Fetch raw BSE data
-    # ---------------------------
-    with st.spinner("Fetching BSE announcements..."):
-        df_raw = fetch_bse_announcements_strict(ds, de, log=logs)
+    with st.spinner("Fetching BSE announcements (Company Update + M&A/JV)..."):
+        df_raw = fetch_bse_announcements_strict(ds, de, verbose=True)
 
-    # Pre-filter into Orders and Capex sets (headline-based).
     orders_df = enrich_orders(df_raw)
-    capex_df = enrich_capex(df_raw)
+    capex_df = enrich_capex_headline(df_raw)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Announcements", len(df_raw))
@@ -730,28 +602,18 @@ if run:
         st.warning("No announcements found for this date range.")
         st.stop()
 
-    # ---------------------------
-    # 2) OpenAI enrichment
-    # ---------------------------
-    client = get_openai_client()
-
     if not orders_df.empty:
-        with st.spinner(
-            "Enriching ALL order announcements via internet + PDF..."
-        ):
-            orders_df = enrich_orders_with_openai(orders_df, df_raw, client)
+        with st.spinner("Enriching ALL order announcements via internet + PDF..."):
+            orders_df = enrich_orders_with_openai(orders_df, df_raw)
 
     if not capex_df.empty:
         with st.spinner(
-            f"Generating 'Impact' commentary for up to {min(MAX_OPENAI_ROWS, len(capex_df))} capex / expansion filings via PDF keyword search..."
+            f"Generating 'Impact' commentary for up to {min(MAX_CAPEX_ROWS_OPENAI, len(capex_df))} capex / expansion filings via PDF keyword search..."
         ):
-            capex_df = enrich_capex_with_openai(capex_df, client)
+            capex_df = enrich_capex_with_openai(capex_df)
 
-    # ---------------------------
-    # 3) Tabs & display
-    # ---------------------------
-    tab_orders, tab_capex, tab_all, tab_logs = st.tabs(
-        ["📦 Orders (Enriched)", "🏭 Capex / Expansion (Impact)", "📄 All Raw", "🧪 Fetch Logs"]
+    tab_orders, tab_capex, tab_all = st.tabs(
+        ["📦 Orders (Enriched)", "🏭 Capex / Expansion (Impact)", "📄 All Raw"]
     )
 
     with tab_orders:
@@ -775,7 +637,3 @@ if run:
 
     with tab_all:
         st.dataframe(df_raw, use_container_width=True)
-
-    with tab_logs:
-        for line in logs:
-            st.text(line)
