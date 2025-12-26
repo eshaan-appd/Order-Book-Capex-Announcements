@@ -37,7 +37,7 @@ BASE_HEADERS = {
 }
 
 OPENAI_MODEL = "gpt-4.1-mini"
-MAX_OPENAI_ROWS = 30  # hard cap on how many rows we enrich per run (cost control)
+MAX_OPENAI_ROWS = 200  # hard cap on how many rows we enrich per run (cost control)
 
 # =========================================
 # OpenAI helpers
@@ -383,6 +383,9 @@ CAPEX_KEYWORDS = [
     "commercial production",
     "commencement of commercial production",
     "commenced commercial production",
+    "capex","capital expenditure","capacity expansion",
+    "new plant","manufacturing facility","brownfield","greenfield",
+    "setting up a plant","increase in capacity","expansion"
 ]
 CAPEX_REGEX = re.compile("|".join(CAPEX_KEYWORDS), re.IGNORECASE)
 
