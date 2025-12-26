@@ -37,7 +37,7 @@ BASE_HEADERS = {
 }
 
 OPENAI_MODEL = "gpt-4.1-mini"
-MAX_OPENAI_ROWS = 200  # hard cap on how many rows we enrich per run (cost control)
+MAX_OPENAI_ROWS = 200  # cap mainly used for capex; orders enrich ALL rows now
 
 # =========================================
 # OpenAI helpers
@@ -378,16 +378,16 @@ ORDER_REGEX = re.compile(
     r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE
 )
 
-# Capex keywords focused on commercial production start.
+# Capex / capacity / plant / expansion keywords (broader set).
 CAPEX_KEYWORDS = [
     "commercial production",
     "commencement of commercial production",
     "commenced commercial production",
-    "capex","capital expenditure","capacity expansion",
-    "new plant","manufacturing facility","brownfield","greenfield",
-    "setting up a plant","increase in capacity","expansion"
+    "capex", "capital expenditure", "capacity expansion",
+    "new plant", "manufacturing facility", "brownfield", "greenfield",
+    "setting up a plant", "increase in capacity", "expansion"
 ]
-CAPEX_REGEX = re.compile("|".join(CAPEX_KEYWORDS), re.IGNORECASE)
+CAPEX_REGEX = re.compile("|".join(map(re.escape, CAPEX_KEYWORDS)), re.IGNORECASE)
 
 def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -407,8 +407,11 @@ def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
 
 def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Filter to capex announcements that reference commercial production,
-    then map into a clean front-end schema.
+    Filter to announcements whose HEADLINE or NEWSSUB contain
+    capex/expansion-related keywords, then map into a clean schema.
+
+    The actual confirmation + impact for capex is done in
+    enrich_capex_with_openai by reading the filing content.
     """
     if df.empty:
         return df
@@ -437,6 +440,8 @@ def enrich_orders_with_openai(
       - Current Order Book (₹ Cr)     [internet + filings/text]
       - Order Book / Sales (x)        [derived metric = OB / Revenue]
       - Execution Timeline            [PDF first → else forecast]
+
+    NOTE: This now enriches **all rows** in orders_df (no head() truncation).
     """
 
     if orders_df.empty:
@@ -455,7 +460,8 @@ def enrich_orders_with_openai(
     # Join back to raw BSE row for attachment lookup
     raw_key = raw_df.set_index(["SLONGNAME", "HEADLINE"])
 
-    for idx, row in df.head(MAX_OPENAI_ROWS).iterrows():
+    # >>> ENRICH ALL ROWS (no .head(MAX_OPENAI_ROWS)) <<<
+    for idx, row in df.iterrows():
 
         company = str(row["Company"])
         ann     = str(row["Announcement"])
@@ -568,13 +574,21 @@ Date: {date_val}
     return df
 
 # =========================================
-# OpenAI enrichment: Capex Impact
+# OpenAI enrichment: Capex Impact (PDF keyword search)
 # =========================================
 
 def enrich_capex_with_openai(capex_df: pd.DataFrame, client: OpenAI) -> pd.DataFrame:
     """
-    Add an 'Impact' paragraph for capex announcements, especially those
-    mentioning 'commercial production'.
+    Add an 'Impact' paragraph for capex / expansion announcements.
+
+    For each candidate:
+      - Upload the filing PDF (if available).
+      - Ask OpenAI to SEARCH INSIDE the filing for the CAPEX_KEYWORDS list:
+        ["commercial production", "capex", "capacity expansion", "new plant",
+         "manufacturing facility", "brownfield", "greenfield", etc.]
+      - Use those matches + context to write an impact paragraph.
+
+    This still limits to MAX_OPENAI_ROWS rows per run for cost control.
     """
     if capex_df.empty:
         return capex_df
@@ -587,36 +601,80 @@ def enrich_capex_with_openai(capex_df: pd.DataFrame, client: OpenAI) -> pd.DataF
         ann = str(row["Announcement"])
         details = str(row.get("Details") or "")
 
-        text_for_filter = (ann + " " + details).lower()
-        if "commercial production" not in text_for_filter:
-            # Skip non-commercial-production items to keep the output focused.
-            continue
+        # ---------- Locate PDF, using Attachment + Link from capex_df ----------
+        pseudo_raw = {
+            "ATTACHMENTNAME": row.get("Attachment"),
+            "NSURL": row.get("Link"),
+        }
+        urls = candidate_pdf_urls(pseudo_raw)
 
+        file_id = None
+        for u in urls:
+            pdf_bytes = download_pdf(u)
+            if pdf_bytes:
+                try:
+                    fobj = upload_pdf_to_openai(client, pdf_bytes, fname="capex.pdf")
+                    file_id = fobj.id
+                    break
+                except Exception:
+                    pass
+            time.sleep(0.2)
+
+        # Build the keyword list string for the prompt.
+        keyword_list_str = ", ".join(CAPEX_KEYWORDS)
+
+        # ---------- PROMPT: explicitly instruct model to search keywords in filing ----------
         prompt = f"""
 You are a sell-side equity research analyst.
 
-Write a concise, investor-focused Impact paragraph (3–6 sentences, max ~140 words)
-for the following capex / commercial production announcement.
+You are given:
+- a BSE announcement (headline + details),
+- and, where available, the full PDF filing for this announcement.
 
-Cover:
-- what has commenced (product, capacity, plant/location),
-- how it changes growth and margin trajectory vs existing business,
-- rough revenue and EBITDA potential range in INR crore if inferable,
-- key execution or market risks during ramp-up.
+First, SEARCH INSIDE the attached PDF filing (if present) for capex/expansion-related
+phrases, focusing on these keywords (and close variants):
 
-Tone: neutral, analytical, no hype. Output plain text only.
+{keyword_list_str}
+
+Use both:
+- the PDF content, and
+- the headline + details text below
+
+to determine the nature of the capex or capacity expansion, including:
+
+- what is being done (new plant / brownfield / greenfield / line expansion / debottlenecking),
+- product or segment involved,
+- location and capacity (if disclosed),
+- total capex outlay in ₹ crore (if disclosed or reasonably inferable).
+
+Then write a concise, investor-focused Impact paragraph (3–6 sentences, max ~140 words)
+answering:
+
+- How does this capex / expansion change the company's growth and margin trajectory
+  vs its existing business?
+- What is the rough revenue and EBITDA potential (₹ crore range) if it ramps up as planned?
+- What are the key execution / market risks during ramp-up?
+
+If the filing is clearly NOT about capex / capacity / plant / expansion, return a short
+sentence like "This filing does not relate to capex or capacity expansion." instead.
+
+Tone: neutral, analytical, no hype. Output plain text only (no bullets).
 
 Company: {company}
 Headline: {ann}
 Details: {details}
 """
 
-        # For Impact we just want text; simple Responses call (no JSON contract).
+        # For Impact we want text; attach PDF if available.
+        content = [{"type": "input_text", "text": prompt}]
+        if file_id:
+            content.append({"type": "input_file", "file_id": file_id})
+
         resp = client.responses.create(
             model=OPENAI_MODEL,
             temperature=0.25,
             max_output_tokens=280,
-            input=prompt,
+            input=[{"role": "user", "content": content}],
         )
         impact = (getattr(resp, "output_text", None) or "").strip()
         df.at[idx, "Impact"] = impact
@@ -657,7 +715,7 @@ if run:
     with st.spinner("Fetching BSE announcements..."):
         df_raw = fetch_bse_announcements_strict(ds, de, log=logs)
 
-    # Pre-filter into Orders and Capex sets.
+    # Pre-filter into Orders and Capex sets (headline-based).
     orders_df = enrich_orders(df_raw)
     capex_df = enrich_capex(df_raw)
 
@@ -665,7 +723,7 @@ if run:
     c1.metric("Total Announcements", len(df_raw))
     c2.metric("Order Announcements", len(orders_df))
     c3.metric(
-        "Capex Announcements (commercial production–filtered)", len(capex_df)
+        "Capex / Expansion Candidates (headline-keyword filtered)", len(capex_df)
     )
 
     if df_raw.empty:
@@ -679,13 +737,13 @@ if run:
 
     if not orders_df.empty:
         with st.spinner(
-            f"Enriching top {min(MAX_OPENAI_ROWS, len(orders_df))} order announcements via internet + PDF..."
+            "Enriching ALL order announcements via internet + PDF..."
         ):
             orders_df = enrich_orders_with_openai(orders_df, df_raw, client)
 
     if not capex_df.empty:
         with st.spinner(
-            "Generating 'Impact' commentary for capex announcements (commercial production)..."
+            f"Generating 'Impact' commentary for up to {min(MAX_OPENAI_ROWS, len(capex_df))} capex / expansion filings via PDF keyword search..."
         ):
             capex_df = enrich_capex_with_openai(capex_df, client)
 
@@ -693,7 +751,7 @@ if run:
     # 3) Tabs & display
     # ---------------------------
     tab_orders, tab_capex, tab_all, tab_logs = st.tabs(
-        ["📦 Orders (Enriched)", "🏭 Capex (Impact)", "📄 All Raw", "🧪 Fetch Logs"]
+        ["📦 Orders (Enriched)", "🏭 Capex / Expansion (Impact)", "📄 All Raw", "🧪 Fetch Logs"]
     )
 
     with tab_orders:
@@ -708,8 +766,10 @@ if run:
 
     with tab_capex:
         st.caption(
-            "Capex announcements filtered on 'commercial production' keywords. "
-            "Impact column is generated by OpenAI."
+            "Capex / expansion candidates are first filtered on headline keywords "
+            "(commercial production, capex, capital expenditure, capacity expansion, "
+            "new plant, brownfield/greenfield, etc.), then OpenAI reads the PDF filing "
+            "and searches for these keywords inside the content to generate the Impact commentary."
         )
         st.dataframe(capex_df, use_container_width=True)
 
