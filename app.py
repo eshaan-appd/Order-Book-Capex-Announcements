@@ -38,7 +38,7 @@ OPENAI_MODEL = "gpt-4.1-mini"
 MAX_OPENAI_ROWS = 30  # limit cost
 
 # =========================================
-# OpenAI helpers (same stack as file 3)
+# OpenAI helpers
 # =========================================
 
 def get_openai_client() -> OpenAI:
@@ -48,8 +48,13 @@ def get_openai_client() -> OpenAI:
         st.stop()
     return OpenAI(api_key=api_key)
 
-def call_openai_json(client: OpenAI, prompt: str, file_id: str | None = None,
-                     max_tokens: int = 600, temperature: float = 0.2) -> dict | None:
+def call_openai_json(
+    client: OpenAI,
+    prompt: str,
+    file_id: str | None = None,
+    max_tokens: int = 600,
+    temperature: float = 0.2,
+) -> dict | None:
     """
     Call Responses API with web_search (and optional PDF file) and
     return parsed JSON dict (or None on failure).
@@ -63,10 +68,12 @@ def call_openai_json(client: OpenAI, prompt: str, file_id: str | None = None,
         temperature=temperature,
         max_output_tokens=max_tokens,
         tools=[{"type": "web_search"}],
-        input=[{
-            "role": "user",
-            "content": content,
-        }],
+        input=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
     )
 
     txt = (getattr(resp, "output_text", None) or "").strip()
@@ -82,9 +89,8 @@ def call_openai_json(client: OpenAI, prompt: str, file_id: str | None = None,
         .replace("’", "'")
     )
 
-    # Try to isolate JSON block
     if "{" in cleaned and "}" in cleaned:
-        cleaned = cleaned[cleaned.find("{"): cleaned.rfind("}") + 1]
+        cleaned = cleaned[cleaned.find("{") : cleaned.rfind("}") + 1]
 
     try:
         return json.loads(cleaned)
@@ -99,7 +105,7 @@ def upload_pdf_to_openai(client: OpenAI, pdf_bytes: bytes, fname: str = "doc.pdf
     return f
 
 # =========================================
-# PDF helpers (adapted from file 3)
+# PDF helpers
 # =========================================
 
 def candidate_pdf_urls(row) -> list[str]:
@@ -116,11 +122,7 @@ def candidate_pdf_urls(row) -> list[str]:
         ]
     ns = str(row.get("NSURL") or "").strip()
     if ".pdf" in ns.lower():
-        cands.append(
-            ns if ns.lower().startswith("http")
-            else HOME + ns.lstrip("/")
-        )
-    # dedupe
+        cands.append(ns if ns.lower().startswith("http") else HOME + ns.lstrip("/"))
     seen, out = set(), []
     for u in cands:
         if u and u not in seen:
@@ -136,11 +138,13 @@ def primary_bse_url(row) -> str:
 
 def download_pdf(url: str, timeout: int = 25) -> bytes | None:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/pdf,application/octet-stream,*/*",
-        "Referer": CORP,
-    })
+    s.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/pdf,application/octet-stream,*/*",
+            "Referer": CORP,
+        }
+    )
     r = s.get(url, timeout=timeout, allow_redirects=True)
     if r.status_code != 200:
         return None
@@ -150,7 +154,7 @@ def download_pdf(url: str, timeout: int = 25) -> bytes | None:
     return data
 
 # =========================================
-# Backend: BSE fetcher (from file 1)
+# Backend: BSE fetcher
 # =========================================
 
 def _call_once(s: requests.Session, url: str, params: dict):
@@ -168,13 +172,16 @@ def _call_once(s: requests.Session, url: str, params: dict):
         pass
     return rows, total, {}
 
-def _fetch_single_range(s, d1: str, d2: str, log):
-    """Fetch full date range without chunking."""
+def _fetch_single_range(s: requests.Session, d1: str, d2: str, log):
+    """
+    Fetch a single date range (usually one day) using multiple parameter
+    permutations to cope with BSE quirks.
+    """
     search_opts = ["", "P"]
-    seg_opts    = ["C", "E"]
+    seg_opts = ["C", "E"]
     subcat_opts = ["", "-1"]
     pageno_keys = ["pageno", "Pageno"]
-    scrip_keys  = ["strScrip", "strscrip"]
+    scrip_keys = ["strScrip", "strscrip"]
 
     for ep in ENDPOINTS:
         for strType in seg_opts:
@@ -194,7 +201,9 @@ def _fetch_single_range(s, d1: str, d2: str, log):
                                 "subcategory": subcategory,
                             }
 
-                            log.append(f"Trying {ep} | {pageno_key} | {scrip_key} | Type={strType}")
+                            log.append(
+                                f"Trying {ep} | {pageno_key} | {scrip_key} | Type={strType} | {d1}..{d2}"
+                            )
 
                             rows_acc = []
                             page = 1
@@ -232,36 +241,78 @@ def _fetch_single_range(s, d1: str, d2: str, log):
     return []
 
 def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=None):
-    """Fetch full date range once — NO throttle, NO chunks."""
+    """
+    Fetch announcements between start_yyyymmdd and end_yyyymmdd (inclusive).
+
+    BSE's API is most reliable when strPrevDate == strToDate, so we iterate
+    day-by-day over the range, call _fetch_single_range for each day, and
+    then aggregate + de-duplicate.
+    """
     if log is None:
         log = []
 
+    # Session & warmup once
     s = requests.Session()
     s.headers.update(BASE_HEADERS)
-
-    # warmup
     try:
         s.get(HOME, timeout=15)
         s.get(CORP, timeout=15)
     except Exception:
         pass
 
-    log.append(f"Full fetch: {start_yyyymmdd}..{end_yyyymmdd}")
+    start_dt = pd.to_datetime(start_yyyymmdd, format="%Y%m%d")
+    end_dt = pd.to_datetime(end_yyyymmdd, format="%Y%m%d")
 
-    all_rows = _fetch_single_range(s, start_yyyymmdd, end_yyyymmdd, log)
+    if end_dt < start_dt:
+        return pd.DataFrame(
+            columns=[
+                "SCRIP_CD",
+                "SLONGNAME",
+                "HEADLINE",
+                "NEWSSUB",
+                "NEWS_DT",
+                "ATTACHMENTNAME",
+                "NSURL",
+            ]
+        )
+
+    all_rows: list[dict] = []
+
+    cur = start_dt
+    while cur <= end_dt:
+        d_str = cur.strftime("%Y%m%d")
+        log.append(f"Day chunk fetch: {d_str}..{d_str}")
+        rows = _fetch_single_range(s, d_str, d_str, log)
+        if rows:
+            all_rows.extend(rows)
+        cur += pd.Timedelta(days=1)
 
     if not all_rows:
-        return pd.DataFrame(columns=[
-            "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
-            "NEWS_DT","ATTACHMENTNAME","NSURL"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "SCRIP_CD",
+                "SLONGNAME",
+                "HEADLINE",
+                "NEWSSUB",
+                "NEWS_DT",
+                "ATTACHMENTNAME",
+                "NSURL",
+            ]
+        )
 
-    base_cols = ["SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
-                 "NEWS_DT","ATTACHMENTNAME","NSURL","NEWSID"]
+    base_cols = [
+        "SCRIP_CD",
+        "SLONGNAME",
+        "HEADLINE",
+        "NEWSSUB",
+        "NEWS_DT",
+        "ATTACHMENTNAME",
+        "NSURL",
+        "NEWSID",
+    ]
 
     seen = set(base_cols)
     extra_cols = []
-
     for r in all_rows:
         for k in r.keys():
             if k not in seen:
@@ -272,16 +323,17 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=N
 
     keys = ["NSURL", "NEWSID", "ATTACHMENTNAME", "HEADLINE"]
     keys = [k for k in keys if k in df.columns]
-
     if keys:
         df = df.drop_duplicates(subset=keys)
 
     if "NEWS_DT" in df.columns:
-        df["_NEWS_DT_PARSED"] = pd.to_datetime(df["NEWS_DT"], errors="coerce", dayfirst=True)
+        df["_NEWS_DT_PARSED"] = pd.to_datetime(
+            df["NEWS_DT"], errors="coerce", dayfirst=True
+        )
         df = (
             df.sort_values("_NEWS_DT_PARSED", ascending=False)
-              .drop(columns=["_NEWS_DT_PARSED"])
-              .reset_index(drop=True)
+            .drop(columns=["_NEWS_DT_PARSED"])
+            .reset_index(drop=True)
         )
 
     return df
@@ -291,9 +343,11 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=N
 # =========================================
 
 ORDER_KEYWORDS = ["order", "contract", "bagged", "supply", "purchase order"]
-ORDER_REGEX = re.compile(r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE)
+ORDER_REGEX = re.compile(
+    r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE
+)
 
-# Focus on commercial production–type capex, as requested
+# Focused on commercial production capex
 CAPEX_KEYWORDS = [
     "commercial production",
     "commencement of commercial production",
@@ -305,18 +359,24 @@ def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     mask = df["HEADLINE"].fillna("").str.contains(ORDER_REGEX)
-    out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","ATTACHMENTNAME","NSURL"]].copy()
-    out.columns = ["Company","Announcement","Details","Date","Attachment","Link"]
+    out = df.loc[
+        mask,
+        ["SLONGNAME", "HEADLINE", "NEWSSUB", "NEWS_DT", "ATTACHMENTNAME", "NSURL"],
+    ].copy()
+    out.columns = ["Company", "Announcement", "Details", "Date", "Attachment", "Link"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
     return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
 def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    combined = (df["HEADLINE"].fillna("") + " " + df["NEWSSUB"].fillna(""))
+    combined = df["HEADLINE"].fillna("") + " " + df["NEWSSUB"].fillna("")
     mask = combined.str.contains(CAPEX_REGEX, na=False)
-    out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","ATTACHMENTNAME","NSURL"]].copy()
-    out.columns = ["Company","Announcement","Details","Date","Attachment","Link"]
+    out = df.loc[
+        mask,
+        ["SLONGNAME", "HEADLINE", "NEWSSUB", "NEWS_DT", "ATTACHMENTNAME", "NSURL"],
+    ].copy()
+    out.columns = ["Company", "Announcement", "Details", "Date", "Attachment", "Link"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
     return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
@@ -324,11 +384,13 @@ def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
 # OpenAI enrichment: Orders
 # =========================================
 
-def enrich_orders_with_openai(orders_df: pd.DataFrame, raw_df: pd.DataFrame, client: OpenAI) -> pd.DataFrame:
+def enrich_orders_with_openai(
+    orders_df: pd.DataFrame, raw_df: pd.DataFrame, client: OpenAI
+) -> pd.DataFrame:
     """
     For each order announcement (top MAX_OPENAI_ROWS):
-      - Use PDF (if available) to extract Existing Order Book (₹ Cr).
-      - Use web_search to get TTM Revenue, Market Cap, Current Order Book (₹ Cr).
+      - Use filing PDF (if available) for Existing Order Book (₹ Cr).
+      - Use web_search for TTM Revenue, Market Cap, Current Order Book (₹ Cr).
     """
     if orders_df.empty:
         return orders_df
@@ -339,30 +401,24 @@ def enrich_orders_with_openai(orders_df: pd.DataFrame, raw_df: pd.DataFrame, cli
     df["Existing Order Book (₹ Cr)"] = np.nan
     df["Current Order Book (₹ Cr)"] = np.nan
 
-    # map back to original rows for ATTACHMENTNAME / NSURL if needed
-    raw_index = raw_df.set_index(["SLONGNAME","HEADLINE","NEWS_DT"])
+    # rough join back to raw df by company + headline
+    raw_key = raw_df.set_index(["SLONGNAME", "HEADLINE"])
 
     for idx, row in df.head(MAX_OPENAI_ROWS).iterrows():
         company = str(row["Company"])
-        ann     = str(row["Announcement"])
+        ann = str(row["Announcement"])
         details = str(row.get("Details") or "")
         date_val = str(row["Date"].date()) if pd.notnull(row["Date"]) else ""
 
-        # locate original row to get attachment name, NSURL
         try:
-            raw_row = raw_index.loc[(company, ann, row["Date"].strftime("%d %b %Y"))]
+            raw_row = raw_key.loc[(company, ann)]
+            if isinstance(raw_row, pd.DataFrame):
+                raw_row = raw_row.iloc[0]
         except Exception:
             raw_row = None
 
-        # --------- PDF upload for existing order book ---------
         file_id = None
-        if raw_row is not None:
-            # raw_row might be Series or DataFrame (if duplicates); take first
-            if isinstance(raw_row, pd.DataFrame):
-                raw_row = raw_row.iloc[0]
-            urls = candidate_pdf_urls(raw_row)
-        else:
-            urls = []
+        urls = candidate_pdf_urls(raw_row) if raw_row is not None else []
 
         for u in urls:
             pdf_bytes = download_pdf(u)
@@ -375,28 +431,26 @@ def enrich_orders_with_openai(orders_df: pd.DataFrame, raw_df: pd.DataFrame, cli
                     file_id = None
             time.sleep(0.3)
 
-        # --------- Build prompt ---------
         prompt = f"""
 You are a fundamental equity analyst specialising in Indian listed companies.
 
-Your tasks for the company and announcement below are:
+Tasks for the company and announcement below:
 
-1) Use web_search to fetch the latest **TTM revenue (Sales TTM)** and **Market Capitalisation** for the listed company.  
-   - Prefer reliable sources such as Screener.in, stock exchange sites, Moneycontrol, etc.  
-   - Convert both to **INR Crore (₹ Cr)**.  
-   - If you fail to obtain a reliable value even after search, return null.
+1) Use web_search to fetch latest **TTM revenue (Sales TTM)** and **Market Capitalisation**.
+   - Prefer reliable sites (Screener.in, exchanges, Moneycontrol etc.).
+   - Convert both into **INR Crore (₹ Cr)**.
+   - If you still cannot find a reliable value, return null.
 
-2) Determine the **Existing Order Book (₹ Cr)** *before* this new order:
-   - Use ONLY the attached PDF filing if available (do NOT use web_search for this field).  
-   - If the filing gives an order book figure, use that.  
-   - If it is not clearly stated in the PDF, return null.
+2) Determine **Existing Order Book (₹ Cr)** *before* this order:
+   - Use ONLY the attached PDF filing (if provided) and the announcement text.
+   - If not clearly stated, return null.
 
-3) Estimate the **Current Order Book (₹ Cr)** *after* including this new order:
-   - Use web_search if needed (e.g., company presentations or recent disclosures).  
-   - Combine the existing order book (from the filing or search) and the value of this newly announced order if you can infer it.  
+3) Estimate **Current Order Book (₹ Cr)** *after* including this order:
+   - Use web_search if needed (presentations, concalls etc.).
+   - Combine existing order book and value of this new order when possible.
    - If you cannot estimate, return null.
 
-Return ONLY valid JSON in this shape (no extra keys, no commentary):
+Return ONLY valid JSON in this exact structure:
 
 {{
   "ttm_revenue_cr": <number or null>,
@@ -423,10 +477,14 @@ Date: {date_val}
             except Exception:
                 return np.nan
 
-        df.at[idx, "TTM Revenue (₹ Cr)"]         = _as_float(data.get("ttm_revenue_cr"))
-        df.at[idx, "Market Cap (₹ Cr)"]          = _as_float(data.get("market_cap_cr"))
-        df.at[idx, "Existing Order Book (₹ Cr)"] = _as_float(data.get("existing_order_book_cr"))
-        df.at[idx, "Current Order Book (₹ Cr)"]  = _as_float(data.get("current_order_book_cr"))
+        df.at[idx, "TTM Revenue (₹ Cr)"] = _as_float(data.get("ttm_revenue_cr"))
+        df.at[idx, "Market Cap (₹ Cr)"] = _as_float(data.get("market_cap_cr"))
+        df.at[idx, "Existing Order Book (₹ Cr)"] = _as_float(
+            data.get("existing_order_book_cr")
+        )
+        df.at[idx, "Current Order Book (₹ Cr)"] = _as_float(
+            data.get("current_order_book_cr")
+        )
 
     return df
 
@@ -437,7 +495,7 @@ Date: {date_val}
 def enrich_capex_with_openai(capex_df: pd.DataFrame, client: OpenAI) -> pd.DataFrame:
     """
     Add an 'Impact' paragraph for capex announcements, especially those
-    with 'commercial production' language.
+    mentioning 'commercial production'.
     """
     if capex_df.empty:
         return capex_df
@@ -447,58 +505,40 @@ def enrich_capex_with_openai(capex_df: pd.DataFrame, client: OpenAI) -> pd.DataF
 
     for idx, row in df.head(MAX_OPENAI_ROWS).iterrows():
         company = str(row["Company"])
-        ann     = str(row["Announcement"])
+        ann = str(row["Announcement"])
         details = str(row.get("Details") or "")
 
         text_for_filter = (ann + " " + details).lower()
         if "commercial production" not in text_for_filter:
-            # we still keep row, but skip Impact to stay aligned with your requirement
             continue
 
         prompt = f"""
 You are a sell-side equity research analyst.
 
-Write a concise, investor-focused **Impact** paragraph (3–6 sentences, max ~140 words)
-for the following capex / plant-commissioning announcement.
+Write a concise, investor-focused Impact paragraph (3–6 sentences, max ~140 words)
+for the following capex / commercial production announcement.
 
-Be specific on:
-- what has commenced (product, capacity, plant location),
-- how it shifts the company's growth and margin trajectory vs existing business,
-- rough revenue and EBITDA potential range in INR crore (if it can be inferred),
-- major execution / market risks that investors should track during ramp-up.
+Cover:
+- what has commenced (product, capacity, plant/location),
+- how it changes growth and margin trajectory vs existing business,
+- rough revenue and EBITDA potential range in INR crore if inferable,
+- key execution or market risks during ramp-up.
 
-Tone: neutral-analytical (no hype, no jargon). Output plain text, no bullets, no heading.
+Tone: neutral, analytical, no hype. Output plain text only.
 
 Company: {company}
 Headline: {ann}
 Details: {details}
 """
 
-        data = call_openai_json(client, prompt, file_id=None, max_tokens=280, temperature=0.25)
-        # For Impact we just want raw text; call_openai_json expects JSON so use a simpler call instead:
-        if data is None:
-            # Fallback: plain text call without JSON schema
-            resp = client.responses.create(
-                model=OPENAI_MODEL,
-                temperature=0.25,
-                max_output_tokens=280,
-                input=prompt,
-            )
-            impact = (getattr(resp, "output_text", None) or "").strip()
-        else:
-            # If the model still returned JSON, try to map a key; otherwise fallback below.
-            impact = data.get("impact") if isinstance(data, dict) else ""
-
-        if not impact:
-            # As extra safety, do a simple non-JSON call
-            resp = client.responses.create(
-                model=OPENAI_MODEL,
-                temperature=0.25,
-                max_output_tokens=280,
-                input=prompt,
-            )
-            impact = (getattr(resp, "output_text", None) or "").strip()
-
+        # For Impact we just want text; do a simple non-JSON call
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            temperature=0.25,
+            max_output_tokens=280,
+            input=prompt,
+        )
+        impact = (getattr(resp, "output_text", None) or "").strip()
         df.at[idx, "Impact"] = impact
 
     return df
@@ -507,7 +547,9 @@ Details: {details}
 # Streamlit UI
 # =========================================
 
-st.set_page_config(page_title="BSE Order & Capex (OpenAI-enriched)", layout="wide")
+st.set_page_config(
+    page_title="BSE Order & Capex (OpenAI-enriched)", layout="wide"
+)
 st.title("📣 BSE Order & Capex Announcements — OpenAI + Web Search")
 
 col1, col2 = st.columns(2)
@@ -531,12 +573,14 @@ if run:
         df_raw = fetch_bse_announcements_strict(ds, de, log=logs)
 
     orders_df = enrich_orders(df_raw)
-    capex_df  = enrich_capex(df_raw)
+    capex_df = enrich_capex(df_raw)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Announcements", len(df_raw))
     c2.metric("Order Announcements", len(orders_df))
-    c3.metric("Capex Announcements (commercial production–filtered)", len(capex_df))
+    c3.metric(
+        "Capex Announcements (commercial production–filtered)", len(capex_df)
+    )
 
     if df_raw.empty:
         st.warning("No announcements found for this date range.")
@@ -545,11 +589,15 @@ if run:
     client = get_openai_client()
 
     if not orders_df.empty:
-        with st.spinner(f"Enriching top {min(MAX_OPENAI_ROWS, len(orders_df))} order announcements via internet + PDF..."):
+        with st.spinner(
+            f"Enriching top {min(MAX_OPENAI_ROWS, len(orders_df))} order announcements via internet + PDF..."
+        ):
             orders_df = enrich_orders_with_openai(orders_df, df_raw, client)
 
     if not capex_df.empty:
-        with st.spinner(f"Generating 'Impact' commentary for capex announcements (commercial production)..."):
+        with st.spinner(
+            "Generating 'Impact' commentary for capex announcements (commercial production)..."
+        ):
             capex_df = enrich_capex_with_openai(capex_df, client)
 
     tab_orders, tab_capex, tab_all, tab_logs = st.tabs(
